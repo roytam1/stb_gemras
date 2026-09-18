@@ -1,0 +1,31 @@
+82/82 decode (0 fail) after porting recoil's GEM Raster coverage.
+
+Previously failing 12, now fixed:
+- `images/BILD0005.IMG`: Falcon 18-byte R8G8B8 path (hdr 18 + `00 03`).
+- `images/FSNAP16.XIMG`, `images/FSNAP256.XIMG`, `images/VRAMSNAP.IMG`: ver 3 allowed.
+- `images/FSNAP32K.TIMG`: TIMG 28-byte 15-plane path.
+- `images/T2__IC2.img`, `images/dupy_tc.img`, `images/laski16m.img`: chunky 24-plane path.
+- `images/test16.img`, `images/ximg.img`: chunky 16-plane path.
+- `images/test32.img`: chunky 32-plane path.
+- `images/teststtt.img`: STTT 54-byte path.
+Plus RLE stream model (opcodes may span rows, `80 00` = 256, `00 00 xx`
+transparent) which the old row-aligned decoder rejected.
+
+Known pixel differences vs recoil 6.4.5 `recoil2png` output (all match
+deark `gemras.c` reference behavior instead):
+- XIMG 0-1000 palette scaling rounds (`(c*255+500)/1000`, maxdiff 1 on
+  17 files: FSNAP16/256, F_030, Jinnee4, MARCHES, THALL, THING256,
+  barbaria, beauty, cndy8, donna, dupy256g, marbre, marisa, pam008,
+  thing16, scrap, vision); recoil truncates (`c*255/1000`).
+- hdr8 multiplane uses grayscale (blu/grn/red/yel/tru256/venus/VRAMSNAP/
+  COLUMNS4/flag_b24/mednopal); recoil uses color default. EGFF states
+  8-field headers display gray-scale; flag_b24 data == 16gray data.
+- hdr9 Ventura gray/color flag honored (16gray renders gray);
+  recoil ignores the flag and renders color.
+- ST palette 9/12-bit by content autodetect (stsorry/teststtt, maxdiff
+  17); recoil forces mode from resolution.
+- Stored (not display-doubled) dimensions: TEST_IMG 320x480 (recoil
+  640x480), TIGER/bg_pic/mednopal half height; folded content is
+  pixel-identical.
+- Truncated input is zero-padded: `images/new.img` decodes here,
+  recoil2png reports "file decoding error".
