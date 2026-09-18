@@ -1,4 +1,4 @@
-/* stb_gemras.h - v1.0 - Digital Research GEM Raster (IMG) decoder in stb_image style */
+/* stb_gemras.h - v1.1 - Digital Research GEM Raster (IMG) decoder in stb_image style */
 /* Public domain. See end of file for license. */
 /*
    This is a single-file C89 decoder for Digital Research GEM VDI Bit Image,
@@ -38,16 +38,21 @@
    count, 1 means gray, 2 means gray+alpha, 3 means RGB, 4 means RGBA.
    Native component count is 1 for monochrome GEM images and 3 otherwise.
 
-   Supported variants (matching deark reference):
-     - 8-word and 9-word headers, 1-8 planes (mono, grayscale, 3/4-plane color)
-     - 25-word headers with Atari ST palette (Hyperpaint and similar)
-     - XIMG extended headers with 0-1000 RGB palette
-   Unsupported (load fails):
-     - 24-plane / 16-plane / 32-plane truecolor, STTT, TIMG and other
-       header sizes, invalid opcodes, truncated headers.
+    Supported variants (deark reference + recoil extensions):
+      - 8-word and 9-word headers, 1-8 planes (mono, grayscale, 3/4-plane color)
+      - 25-word headers with Atari ST palette (Hyperpaint and similar)
+      - XIMG extended headers with 0-1000 RGB palette (direct index)
+      - XIMG 8-plane header-only grayscale, STTT 54-byte, TIMG 28-byte
+        15/16/24-plane, chunky 16/24/32-plane truecolor, Falcon 18-byte
+        R8G8B8 triplets
+    Unsupported (load fails):
+      - other header sizes, invalid opcodes.
 
-   Decompression implements the four GEM opcodes: solid run, literal run
-   (0x80), pattern run (0x00 nn) and scanline repeat (0x00 0x00 0xFF nn).
+    Decompression implements the four GEM opcodes: solid run, literal run
+    (0x80, with 0x80 0x00 meaning 256 bytes like recoil), pattern run
+    (0x00 nn) and scanline repeat (0x00 0x00 0xFF nn, total count).
+    Opcodes may span output rows (recoil stream model); truncated input
+    is zero-padded.
 
    This header is C89 clean. Define STB_GEMRAS_NO_STDIO to remove the
    filename based APIs. Define STB_GEMRAS_STATIC to make all functions
@@ -168,6 +173,45 @@ static unsigned char stb_gemras__scale_n(int n, int x)
     return (unsigned char)((x * 255 + n / 2) / n);
 }
 
+/* recoil truecolor helpers: packed 0xRRGGBB in int */
+static int stb_gemras__b5g5r5(int c)
+{
+    int r;
+    r = (c & 31) << 19 | (c & 992) << 6 | (c >> 7 & 248);
+    r |= (r >> 5 & 460551);
+    return r;
+}
+
+static int stb_gemras__falcon_tc(const unsigned char *d)
+{
+    int rg;
+    int gb;
+    int rgb;
+    rg = d[0];
+    gb = d[1];
+    rgb = (rg & 248) << 16 | (rg & 7) << 13 | (gb & 224) << 5 | (gb & 31) << 3;
+    rgb |= (rgb >> 5 & 458759) | (rgb >> 6 & 768);
+    return rgb;
+}
+
+static int stb_gemras__r8g8b8(const unsigned char *d)
+{
+    return ((int)d[0] << 16) | ((int)d[1] << 8) | (int)d[2];
+}
+
+static int stb_gemras__planar16(int c)
+{
+    int r;
+    r = (c & 31) << 19 | (c & 2016) << 5 | (c >> 8 & 248);
+    r |= (r >> 5 & 458759) | (r >> 6 & 768);
+    return r;
+}
+
+static int stb_gemras__planar24(int c)
+{
+    return ((c & 255) << 16) | (c & 65280) | ((c >> 16) & 255);
+}
+
 /* header description */
 struct stb_gemras__hdr {
     int ver;
@@ -201,7 +245,7 @@ static int stb_gemras__parse_header(const unsigned char *data, int len, struct s
     h->is_ximg = 0;
     h->ext_word0 = 0;
 
-    if (h->ver < 0 || h->ver > 2) {
+    if (h->ver < 0 || h->ver > 3) {
         stb_gemras__err("unsupported version");
         return 0;
     }
@@ -248,29 +292,71 @@ static int stb_gemras__parse_header(const unsigned char *data, int len, struct s
     return 1;
 }
 
-/* 0 = unsupported variant, 1 = supported */
-static int stb_gemras__is_supported(struct stb_gemras__hdr *h)
+/* recoil-style variant checks; data/len needed for magic checks */
+static int stb_gemras__is_falcon(const unsigned char *data, int len, struct stb_gemras__hdr *h)
 {
-    if (h->is_ximg) {
-        if (h->nplanes < 1 || h->nplanes > 8) {
-            stb_gemras__err("unsupported plane count");
-            return 0;
-        }
-        return 1;
+    if (h->hdr_bytes != 18) return 0;
+    if (len < 18) return 0;
+    if (data[16] == 0 && data[17] == 3) return 1;
+    return 0;
+}
+
+static int stb_gemras__is_sttt(const unsigned char *data, int len, struct stb_gemras__hdr *h)
+{
+    if (h->hdr_bytes != 54) return 0;
+    if (len < 22) return 0;
+    if (data[16] == 83 && data[17] == 84 && data[18] == 84 && data[19] == 84) {
+        if (data[20] == 0 && data[21] == 16) return 1;
     }
-    if (h->hdr_words == 25) {
-        if (h->nplanes < 1 || h->nplanes > 8) {
-            stb_gemras__err("unsupported plane count");
-            return 0;
-        }
-        return 1;
+    return 0;
+}
+
+/* 0 = no, else planar bits for TIMG (15, 16 or 24) */
+static int stb_gemras__timg_planes(const unsigned char *data, int len, struct stb_gemras__hdr *h)
+{
+    unsigned int key;
+    if (h->hdr_bytes != 28) return 0;
+    if (len < 28) return 0;
+    if (!(data[16] == 84 && data[17] == 73 && data[18] == 77 && data[19] == 71)) return 0;
+    if (!(data[20] == 0 && data[21] == 3 && data[22] == 0 && data[24] == 0 && data[26] == 0)) return 0;
+    key = ((unsigned int)h->nplanes << 24) | ((unsigned int)data[23] << 16) | ((unsigned int)data[25] << 8) | (unsigned int)data[27];
+    if (key == 251987205U || key == 268764677U || key == 403179528U) {
+        return h->nplanes;
     }
-    if (h->hdr_words == 8 || h->hdr_words == 9) {
+    return 0;
+}
+
+static int stb_gemras__is_chunky_planes(int p)
+{
+    if (p == 16 || p == 24 || p == 32) return 1;
+    return 0;
+}
+
+#define STB_GEMRAS__V_FALCON 1
+#define STB_GEMRAS__V_TIMG 2
+#define STB_GEMRAS__V_STTT 3
+#define STB_GEMRAS__V_CHUNKY 4
+#define STB_GEMRAS__V_PLANAR 5
+
+/* classify decodable variant; 0 = unsupported (err set) */
+static int stb_gemras__classify(const unsigned char *data, int len, struct stb_gemras__hdr *h)
+{
+    if (stb_gemras__is_falcon(data, len, h)) return STB_GEMRAS__V_FALCON;
+    if (stb_gemras__timg_planes(data, len, h)) return STB_GEMRAS__V_TIMG;
+    if (stb_gemras__is_sttt(data, len, h)) {
         if (h->nplanes < 1 || h->nplanes > 8) {
             stb_gemras__err("unsupported plane count");
             return 0;
         }
-        return 1;
+        return STB_GEMRAS__V_STTT;
+    }
+    if (stb_gemras__is_chunky_planes(h->nplanes)) return STB_GEMRAS__V_CHUNKY;
+    if (h->is_ximg || h->hdr_words == 25 || h->hdr_words == 8 || h->hdr_words == 9 || h->hdr_words == 11) {
+        if (h->nplanes < 1 || h->nplanes > 8) {
+            stb_gemras__err("unsupported plane count");
+            return 0;
+        }
+        return STB_GEMRAS__V_PLANAR;
     }
     stb_gemras__err("unsupported GEM variant");
     return 0;
@@ -378,6 +464,170 @@ static int stb_gemras__read_ximg_pal(const unsigned char *data, int len,
     return toread;
 }
 
+/* recoil-style byte RLE stream: opcodes may span output rows.
+   0x00 nn (nn>0): pattern of patlen bytes repeated nn times.
+   0x00 0x00 xx: xx+1 transparent bytes (prev row, or 0 on row 0).
+   0x00 0x00 0xFF nn is consumed as line repeat before rows, not here.
+   0x80 nn: nn literal bytes (0 means 256). else: solid run. */
+struct stb_gemras__rle {
+    const unsigned char *data;
+    int len;
+    int pos;
+    int repeatCount;
+    int repeatValue;
+    int patternRepeatCount;
+    int patlen;
+};
+
+static void stb_gemras__rle_init(struct stb_gemras__rle *r, const unsigned char *data, int len, int pos, int patlen)
+{
+    r->data = data;
+    r->len = len;
+    r->pos = pos;
+    r->repeatCount = 0;
+    r->repeatValue = 0;
+    r->patternRepeatCount = 0;
+    r->patlen = patlen;
+}
+
+/* line repeat 00 00 FF nn: returns total count>=1 and consumes it,
+   1 if none pending, -1 on corrupt zero count */
+static int stb_gemras__rle_line_rep(struct stb_gemras__rle *r)
+{
+    int c;
+    if (r->repeatCount != 0) return 1;
+    if (r->pos + 4 > r->len) return 1;
+    if (r->data[r->pos] != 0) return 1;
+    if (r->data[r->pos + 1] != 0) return 1;
+    if (r->data[r->pos + 2] != 255) return 1;
+    c = r->data[r->pos + 3];
+    if (c == 0) return -1;
+    r->pos += 4;
+    return c;
+}
+
+static int stb_gemras__rle_command(struct stb_gemras__rle *r)
+{
+    int b;
+    if (r->patternRepeatCount > 1) {
+        if (r->patlen <= 0) return 0;
+        r->patternRepeatCount--;
+        r->repeatCount = r->patlen;
+        r->pos -= r->patlen;
+        return 1;
+    }
+    if (r->pos >= r->len) return 0;
+    b = r->data[r->pos++];
+    if (b == 0) {
+        if (r->pos >= r->len) return 0;
+        b = r->data[r->pos++];
+        if (b == 0) {
+            if (r->pos >= r->len) return 0;
+            b = r->data[r->pos++];
+            r->repeatCount = b + 1;
+            r->repeatValue = 256;
+            return 1;
+        }
+        if (r->patlen <= 0) return 0;
+        r->patternRepeatCount = b;
+        r->repeatCount = r->patlen;
+        r->repeatValue = -1;
+        return 1;
+    }
+    if (b == 128) {
+        if (r->pos >= r->len) return 0;
+        r->repeatCount = r->data[r->pos++];
+        if (r->repeatCount == 0) r->repeatCount = 256;
+        r->repeatValue = -1;
+        return 1;
+    }
+    r->repeatCount = b & 127;
+    r->repeatValue = b >= 128 ? 255 : 0;
+    return 1;
+}
+
+static int stb_gemras__rle_byte(struct stb_gemras__rle *r)
+{
+    for (;;) {
+        if (r->repeatCount != 0) break;
+        if (!stb_gemras__rle_command(r)) return -1;
+    }
+    r->repeatCount--;
+    if (r->repeatValue >= 0) return r->repeatValue;
+    if (r->pos >= r->len) return -1;
+    return r->data[r->pos++];
+}
+
+/* decode one line of n bytes; transparent keeps prev (or 0 on row 0).
+   returns 1 full, 0 truncated (rest zero-filled) */
+static int stb_gemras__rle_line(struct stb_gemras__rle *r, unsigned char *out, const unsigned char *prev, int n, int y)
+{
+    int x;
+    int b;
+    for (x = 0; x < n; x++) {
+        b = stb_gemras__rle_byte(r);
+        if (b < 0) {
+            for (; x < n; x++) out[x] = 0;
+            return 0;
+        }
+        if (b != 256) out[x] = (unsigned char)b;
+        else if (y == 0) out[x] = 0;
+        else out[x] = prev[x];
+    }
+    return 1;
+}
+
+/* decode h rows of bytesPerLine bytes into unc (caller zeroed).
+   returns 1 ok (trailing rows stay zero if truncated), 0 corrupt */
+static int stb_gemras__rle_rows(const unsigned char *data, int len, int hdr_bytes, int patlen, int bytesPerLine, int h, unsigned char *unc)
+{
+    struct stb_gemras__rle r;
+    unsigned char *line;
+    unsigned char *prev;
+    int y;
+    int i;
+    int k;
+    int dst;
+    int rep;
+    int ok;
+    if (bytesPerLine <= 0) {
+        stb_gemras__err("bad dimensions");
+        return 0;
+    }
+    stb_gemras__rle_init(&r, data, len, hdr_bytes, patlen);
+    line = (unsigned char *)STB_GEMRAS_MALLOC((size_t)bytesPerLine);
+    prev = (unsigned char *)STB_GEMRAS_MALLOC((size_t)bytesPerLine);
+    if (!line || !prev) {
+        if (line) STB_GEMRAS_FREE(line);
+        if (prev) STB_GEMRAS_FREE(prev);
+        stb_gemras__err("out of memory");
+        return 0;
+    }
+    for (i = 0; i < bytesPerLine; i++) prev[i] = 0;
+    y = 0;
+    while (y < h) {
+        rep = stb_gemras__rle_line_rep(&r);
+        if (rep < 0) {
+            STB_GEMRAS_FREE(line);
+            STB_GEMRAS_FREE(prev);
+            stb_gemras__err("corrupt data");
+            return 0;
+        }
+        if (rep > h - y) rep = h - y;
+        ok = stb_gemras__rle_line(&r, line, prev, bytesPerLine, y);
+        if (!ok) break;
+        for (i = 0; i < rep; i++) {
+            dst = (y + i) * bytesPerLine;
+            for (k = 0; k < bytesPerLine; k++) unc[dst + k] = line[k];
+        }
+        for (i = 0; i < bytesPerLine; i++) prev[i] = line[i];
+        y += rep;
+    }
+    STB_GEMRAS_FREE(line);
+    STB_GEMRAS_FREE(prev);
+    return 1;
+}
+
 /* decompress planar data into unc (size rowspan_total*h, zeroed).
    Returns 1 on success (possibly truncated with zero padding), 0 on error. */
 static int stb_gemras__decompress(const unsigned char *data, int len,
@@ -387,202 +637,17 @@ static int stb_gemras__decompress(const unsigned char *data, int len,
 {
     int rowspan_per_plane;
     int rowspan_total;
-    int curpos;
-    int rownum;
-    unsigned char *linebuf;
-    int i;
-
+    if (patlen <= 0 || patlen > 16) {
+        stb_gemras__err("bad pattern length");
+        return 0;
+    }
     rowspan_per_plane = pdwidth / 8;
     rowspan_total = rowspan_per_plane * nplanes;
     if (rowspan_per_plane <= 0 || rowspan_total <= 0) {
         stb_gemras__err("bad dimensions");
         return 0;
     }
-
-    linebuf = (unsigned char *)STB_GEMRAS_MALLOC((size_t)(rowspan_total + 16));
-    if (!linebuf) {
-        stb_gemras__err("out of memory");
-        return 0;
-    }
-
-    curpos = hdr_bytes;
-    rownum = 0;
-
-    while (rownum < h) {
-        int plane;
-        int repeat_count;
-        int row_ok;
-        for (i = 0; i < rowspan_total + 16; i++) linebuf[i] = 0;
-
-        repeat_count = 0;
-        row_ok = 1;
-
-        for (plane = 0; plane < nplanes; plane++) {
-            int prev_ipos;
-            int start_off;
-            int end_off;
-            int wpos;
-            int total_written;
-            int pos1;
-
-            if (curpos >= len) {
-                row_ok = 0;
-                break;
-            }
-            prev_ipos = curpos;
-            start_off = plane * rowspan_per_plane;
-            end_off = (plane + 1) * rowspan_per_plane;
-            wpos = start_off;
-            if (plane == 0) {
-                repeat_count = 1;
-            }
-            pos1 = curpos;
-
-            while (wpos < end_off) {
-                unsigned char b0;
-                if (curpos >= len) break;
-                b0 = data[curpos++];
-                if (b0 == 0) {
-                    unsigned char b1;
-                    if (curpos >= len) break;
-                    b1 = data[curpos++];
-                    if (b1 > 0) {
-                        int k, j;
-                        int opcode_ok;
-                        opcode_ok = 1;
-                        if (patlen <= 0 || patlen > 16) {
-                            stb_gemras__err("bad pattern length");
-                            STB_GEMRAS_FREE(linebuf);
-                            return 0;
-                        }
-                        if (curpos + patlen > len) {
-                            break;
-                        }
-                        for (k = 0; k < (int)b1; k++) {
-                            for (j = 0; j < patlen; j++) {
-                                unsigned char v;
-                                v = data[curpos + j];
-                                if (wpos < end_off) {
-                                    linebuf[wpos] = v;
-                                } else if (wpos < end_off + 16) {
-                                    linebuf[wpos] = v;
-                                }
-                                wpos++;
-                                if (wpos > end_off + 64) {
-                                    opcode_ok = 0;
-                                    break;
-                                }
-                            }
-                            if (!opcode_ok) break;
-                        }
-                        curpos += patlen;
-                    } else {
-                        unsigned char flagbyte;
-                        unsigned char cnt;
-                        int opcode_pos;
-                        opcode_pos = curpos - 2;
-                        if (curpos >= len) break;
-                        flagbyte = data[curpos++];
-                        if (flagbyte != 0xFF) {
-                            stb_gemras__err("corrupt data");
-                            STB_GEMRAS_FREE(linebuf);
-                            return 0;
-                        }
-                        if (plane != 0 || opcode_pos != pos1) {
-                            stb_gemras__err("corrupt data");
-                            STB_GEMRAS_FREE(linebuf);
-                            return 0;
-                        }
-                        if (curpos >= len) break;
-                        cnt = data[curpos++];
-                        if (cnt == 0) {
-                            stb_gemras__err("corrupt data");
-                            STB_GEMRAS_FREE(linebuf);
-                            return 0;
-                        }
-                        repeat_count = (int)cnt;
-                    }
-                } else if (b0 == 0x80) {
-                    unsigned char cnt;
-                    int k;
-                    if (curpos >= len) break;
-                    cnt = data[curpos++];
-                    if (curpos + (int)cnt > len) {
-                        break;
-                    }
-                    for (k = 0; k < (int)cnt; k++) {
-                        unsigned char v;
-                        v = data[curpos++];
-                        if (wpos < end_off + 16) {
-                            if (wpos < rowspan_total + 16) {
-                                linebuf[wpos] = v;
-                            }
-                        }
-                        wpos++;
-                        if (wpos > end_off + 64) break;
-                    }
-                } else {
-                    unsigned char v;
-                    int cnt;
-                    int k;
-                    v = (b0 & 0x80) ? 0xFF : 0x00;
-                    cnt = (int)(b0 & 0x7F);
-                    for (k = 0; k < cnt; k++) {
-                        if (wpos < end_off + 16) {
-                            if (wpos < rowspan_total + 16) {
-                                linebuf[wpos] = v;
-                            }
-                        }
-                        wpos++;
-                        if (wpos > end_off + 64) break;
-                    }
-                }
-                if (wpos > end_off + 64) break;
-            }
-
-            if (curpos <= prev_ipos) {
-                row_ok = 0;
-                break;
-            }
-            if (wpos < start_off) {
-                wpos = start_off;
-            }
-            total_written = wpos - start_off;
-            if (wpos < end_off) {
-                /* truncated plane row: treat as end of data */
-                if (curpos >= len) {
-                    row_ok = 0;
-                    break;
-                }
-                /* otherwise pad with zeros */
-                for (i = wpos; i < end_off; i++) linebuf[i] = 0;
-            } else if (total_written > rowspan_per_plane + 4) {
-                stb_gemras__err("corrupt data");
-                STB_GEMRAS_FREE(linebuf);
-                return 0;
-            }
-            /* truncate extra bytes (ignore beyond end_off) */
-        }
-
-        if (!row_ok) {
-            break;
-        }
-        if (repeat_count <= 0) repeat_count = 1;
-        if (repeat_count > 255) repeat_count = 255;
-        for (i = 0; i < repeat_count; i++) {
-            int dst;
-            int k;
-            if (rownum >= h) break;
-            dst = rownum * rowspan_total;
-            for (k = 0; k < rowspan_total; k++) {
-                unc[dst + k] = linebuf[k];
-            }
-            rownum++;
-        }
-    }
-
-    STB_GEMRAS_FREE(linebuf);
-    return 1;
+    return stb_gemras__rle_rows(data, len, hdr_bytes, patlen, rowspan_total, h, unc);
 }
 
 static void stb_gemras__setup_default_pal(int nplanes, int is_color,
@@ -638,6 +703,370 @@ static void stb_gemras__setup_default_pal(int nplanes, int is_color,
     }
 }
 
+/* Falcon 18-byte header: 0x80-counted R8G8B8 triplets, count 0 invalid */
+static unsigned char *stb_gemras__decode_falcon(const unsigned char *data, int len, struct stb_gemras__hdr *h, int *x, int *y, int *comp_native)
+{
+    int w;
+    int hh;
+    long npix;
+    long outsize;
+    int i;
+    int off;
+    int count;
+    unsigned char *out;
+    w = h->npwidth;
+    hh = h->height;
+    if (w <= 0 || hh <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    if (w > 0 && hh > (200 * 1024 * 1024) / (w * 3)) {
+        stb_gemras__err("image too large");
+        return NULL;
+    }
+    npix = (long)w * (long)hh;
+    outsize = npix * 3L;
+    if (outsize <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    out = (unsigned char *)STB_GEMRAS_MALLOC((size_t)outsize);
+    if (!out) {
+        stb_gemras__err("out of memory");
+        return NULL;
+    }
+    for (i = 0; i < (int)outsize; i++) out[i] = 0;
+    off = 18;
+    count = 0;
+    for (i = 0; i < (int)npix; i++) {
+        if (count == 0) {
+            if (off + 1 >= len) break;
+            if (data[off++] != 128) {
+                STB_GEMRAS_FREE(out);
+                stb_gemras__err("corrupt data");
+                return NULL;
+            }
+            count = data[off++];
+            if (count == 0) {
+                STB_GEMRAS_FREE(out);
+                stb_gemras__err("corrupt data");
+                return NULL;
+            }
+        }
+        if (off + 2 >= len) break;
+        out[i * 3 + 0] = data[off + 2];
+        out[i * 3 + 1] = data[off + 1];
+        out[i * 3 + 2] = data[off];
+        off += 3;
+        count--;
+    }
+    if (x) *x = w;
+    if (y) *y = hh;
+    if (comp_native) *comp_native = 3;
+    return out;
+}
+
+/* chunky 16/24/32-plane truecolor via recoil stream model */
+static unsigned char *stb_gemras__decode_chunky(const unsigned char *data, int len, struct stb_gemras__hdr *h, int *x, int *y, int *comp_native)
+{
+    int w;
+    int hh;
+    int bpb;
+    int bpl;
+    long outsize;
+    unsigned char *out;
+    unsigned char *line;
+    unsigned char *prev;
+    struct stb_gemras__rle r;
+    int yy;
+    int i;
+    int k;
+    int xx;
+    int ii;
+    int rep;
+    int ok;
+    int rgb;
+    w = h->npwidth;
+    hh = h->height;
+    if (w <= 0 || hh <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    if (w > 0 && hh > (200 * 1024 * 1024) / (w * 3)) {
+        stb_gemras__err("image too large");
+        return NULL;
+    }
+    outsize = (long)w * (long)hh * 3L;
+    if (outsize <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    bpb = (w + 7) >> 3;
+    if (h->nplanes == 24) bpb = (bpb + 1) & ~1;
+    bpl = h->nplanes * bpb;
+    if (bpb <= 0 || bpl <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    if (bpl > 0 && hh > (200 * 1024 * 1024) / bpl) {
+        stb_gemras__err("image too large");
+        return NULL;
+    }
+    out = (unsigned char *)STB_GEMRAS_MALLOC((size_t)outsize);
+    line = (unsigned char *)STB_GEMRAS_MALLOC((size_t)bpl);
+    prev = (unsigned char *)STB_GEMRAS_MALLOC((size_t)bpl);
+    if (!out || !line || !prev) {
+        if (out) STB_GEMRAS_FREE(out);
+        if (line) STB_GEMRAS_FREE(line);
+        if (prev) STB_GEMRAS_FREE(prev);
+        stb_gemras__err("out of memory");
+        return NULL;
+    }
+    for (i = 0; i < (int)outsize; i++) out[i] = 0;
+    for (i = 0; i < bpl; i++) prev[i] = 0;
+    stb_gemras__rle_init(&r, data, len, h->hdr_bytes, h->patlen);
+    yy = 0;
+    while (yy < hh) {
+        rep = stb_gemras__rle_line_rep(&r);
+        if (rep < 0) {
+            STB_GEMRAS_FREE(out);
+            STB_GEMRAS_FREE(line);
+            STB_GEMRAS_FREE(prev);
+            stb_gemras__err("corrupt data");
+            return NULL;
+        }
+        if (rep > hh - yy) rep = hh - yy;
+        ok = stb_gemras__rle_line(&r, line, prev, bpl, yy);
+        if (!ok) break;
+        for (i = 0; i < rep; i++) {
+            for (xx = 0; xx < w; xx++) {
+                if (h->nplanes == 16) {
+                    rgb = stb_gemras__falcon_tc(line + xx * 2);
+                } else if (h->nplanes == 24) {
+                    rgb = stb_gemras__r8g8b8(line + xx * 3);
+                } else {
+                    rgb = stb_gemras__r8g8b8(line + xx * 4 + 1);
+                }
+                ii = ((yy + i) * w + xx) * 3;
+                out[ii + 0] = (unsigned char)((rgb >> 16) & 255);
+                out[ii + 1] = (unsigned char)((rgb >> 8) & 255);
+                out[ii + 2] = (unsigned char)(rgb & 255);
+            }
+        }
+        for (k = 0; k < bpl; k++) prev[k] = line[k];
+        yy += rep;
+    }
+    STB_GEMRAS_FREE(line);
+    STB_GEMRAS_FREE(prev);
+    if (x) *x = w;
+    if (y) *y = hh;
+    if (comp_native) *comp_native = 3;
+    return out;
+}
+
+/* TIMG planar 15/16/24-bit truecolor */
+static unsigned char *stb_gemras__decode_timg(const unsigned char *data, int len, struct stb_gemras__hdr *h, int planes, int *x, int *y, int *comp_native)
+{
+    int w;
+    int hh;
+    int bpb;
+    int bpl;
+    long total;
+    long outsize;
+    int i;
+    int xx;
+    int yy;
+    int p;
+    int c;
+    int rgb;
+    unsigned char b;
+    int bit;
+    int byteidx;
+    unsigned char *raw;
+    unsigned char *out;
+    w = h->npwidth;
+    hh = h->height;
+    if (w <= 0 || hh <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    bpb = (w + 7) >> 3;
+    bpl = planes * bpb;
+    if (bpb <= 0 || bpl <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    if (bpl > 0 && hh > (200 * 1024 * 1024) / bpl) {
+        stb_gemras__err("image too large");
+        return NULL;
+    }
+    total = (long)bpl * (long)hh;
+    if (total <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    if (w > 0 && hh > (200 * 1024 * 1024) / (w * 3)) {
+        stb_gemras__err("image too large");
+        return NULL;
+    }
+    outsize = (long)w * (long)hh * 3L;
+    if (outsize <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    raw = (unsigned char *)STB_GEMRAS_MALLOC((size_t)total);
+    out = (unsigned char *)STB_GEMRAS_MALLOC((size_t)outsize);
+    if (!raw || !out) {
+        if (raw) STB_GEMRAS_FREE(raw);
+        if (out) STB_GEMRAS_FREE(out);
+        stb_gemras__err("out of memory");
+        return NULL;
+    }
+    for (i = 0; i < (int)total; i++) raw[i] = 0;
+    if (!stb_gemras__rle_rows(data, len, h->hdr_bytes, h->patlen, bpl, hh, raw)) {
+        STB_GEMRAS_FREE(raw);
+        STB_GEMRAS_FREE(out);
+        return NULL;
+    }
+    for (yy = 0; yy < hh; yy++) {
+        for (xx = 0; xx < w; xx++) {
+            c = 0;
+            byteidx = xx / 8;
+            bit = 7 - (xx % 8);
+            for (p = 0; p < planes; p++) {
+                b = raw[yy * bpl + p * bpb + byteidx];
+                if (b & (1 << bit)) c |= (1 << p);
+            }
+            if (planes == 15) rgb = stb_gemras__b5g5r5(c);
+            else if (planes == 16) rgb = stb_gemras__planar16(c);
+            else rgb = stb_gemras__planar24(c);
+            out[(yy * w + xx) * 3 + 0] = (unsigned char)((rgb >> 16) & 255);
+            out[(yy * w + xx) * 3 + 1] = (unsigned char)((rgb >> 8) & 255);
+            out[(yy * w + xx) * 3 + 2] = (unsigned char)(rgb & 255);
+        }
+    }
+    STB_GEMRAS_FREE(raw);
+    if (x) *x = w;
+    if (y) *y = hh;
+    if (comp_native) *comp_native = 3;
+    return out;
+}
+
+/* STTT planar accumulation with ST palette at offset 22 */
+static unsigned char *stb_gemras__decode_sttt(const unsigned char *data, int len, struct stb_gemras__hdr *h, int *x, int *y, int *comp_native)
+{
+    int w;
+    int hh;
+    int bpb;
+    long npix;
+    long outsize;
+    int i;
+    int k;
+    int xx;
+    int yy;
+    int plane;
+    int rep;
+    int ok;
+    int bit;
+    unsigned char *idx;
+    unsigned char *out;
+    unsigned char *line;
+    unsigned char *prev;
+    unsigned char pal_r[16];
+    unsigned char pal_g[16];
+    unsigned char pal_b[16];
+    unsigned char tr[16];
+    unsigned char tg[16];
+    unsigned char tb[16];
+    struct stb_gemras__rle r;
+    w = h->npwidth;
+    hh = h->height;
+    if (w <= 0 || hh <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    if (w > 0 && hh > (200 * 1024 * 1024) / (w * 3)) {
+        stb_gemras__err("image too large");
+        return NULL;
+    }
+    npix = (long)w * (long)hh;
+    outsize = npix * 3L;
+    if (outsize <= 0 || npix <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    bpb = (w + 7) >> 3;
+    if (bpb <= 0) {
+        stb_gemras__err("bad dimensions");
+        return NULL;
+    }
+    for (i = 0; i < 16; i++) tr[i] = tg[i] = tb[i] = 0;
+    if (len < 54) {
+        stb_gemras__err("truncated header");
+        return NULL;
+    }
+    stb_gemras__read_atari_pal(data, len, 22, tr, tg, tb);
+    for (i = 0; i < 16; i++) {
+        pal_r[i] = tr[i];
+        pal_g[i] = tg[i];
+        pal_b[i] = tb[i];
+    }
+    idx = (unsigned char *)STB_GEMRAS_MALLOC((size_t)npix);
+    out = (unsigned char *)STB_GEMRAS_MALLOC((size_t)outsize);
+    line = (unsigned char *)STB_GEMRAS_MALLOC((size_t)bpb);
+    prev = (unsigned char *)STB_GEMRAS_MALLOC((size_t)bpb);
+    if (!idx || !out || !line || !prev) {
+        if (idx) STB_GEMRAS_FREE(idx);
+        if (out) STB_GEMRAS_FREE(out);
+        if (line) STB_GEMRAS_FREE(line);
+        if (prev) STB_GEMRAS_FREE(prev);
+        stb_gemras__err("out of memory");
+        return NULL;
+    }
+    for (i = 0; i < (int)npix; i++) idx[i] = 0;
+    for (i = 0; i < (int)outsize; i++) out[i] = 0;
+    stb_gemras__rle_init(&r, data, len, h->hdr_bytes, h->patlen);
+    for (plane = 0; plane < h->nplanes; plane++) {
+        for (i = 0; i < bpb; i++) prev[i] = 0;
+        yy = 0;
+        while (yy < hh) {
+            rep = stb_gemras__rle_line_rep(&r);
+            if (rep < 0) {
+                STB_GEMRAS_FREE(idx);
+                STB_GEMRAS_FREE(out);
+                STB_GEMRAS_FREE(line);
+                STB_GEMRAS_FREE(prev);
+                stb_gemras__err("corrupt data");
+                return NULL;
+            }
+            if (rep > hh - yy) rep = hh - yy;
+            ok = stb_gemras__rle_line(&r, line, prev, bpb, yy);
+            if (!ok) break;
+            for (i = 0; i < rep; i++) {
+                for (xx = 0; xx < w; xx++) {
+                    bit = (line[xx >> 3] >> (7 - (xx & 7))) & 1;
+                    idx[(yy + i) * w + xx] |= (unsigned char)(bit << plane);
+                }
+            }
+            for (k = 0; k < bpb; k++) prev[k] = line[k];
+            yy += rep;
+        }
+    }
+    for (i = 0; i < (int)npix; i++) {
+        k = idx[i] & 15;
+        out[i * 3 + 0] = pal_r[k];
+        out[i * 3 + 1] = pal_g[k];
+        out[i * 3 + 2] = pal_b[k];
+    }
+    STB_GEMRAS_FREE(idx);
+    STB_GEMRAS_FREE(line);
+    STB_GEMRAS_FREE(prev);
+    if (x) *x = w;
+    if (y) *y = hh;
+    if (comp_native) *comp_native = 3;
+    return out;
+}
+
 /* core decode: returns malloced RGB or gray buffer, sets *x,*y,*comp_native.
    comp_native is 1 or 3. Returns NULL on failure. */
 static unsigned char *stb_gemras__decode(const unsigned char *data, int len,
@@ -660,7 +1089,32 @@ static unsigned char *stb_gemras__decode(const unsigned char *data, int len,
     if (!stb_gemras__parse_header(data, len, &h)) {
         return NULL;
     }
-    if (!stb_gemras__is_supported(&h)) {
+    if (stb_gemras__is_falcon(data, len, &h)) {
+        return stb_gemras__decode_falcon(data, len, &h, x, y, comp_native);
+    }
+    {
+        int timg_p;
+        timg_p = stb_gemras__timg_planes(data, len, &h);
+        if (timg_p) {
+            return stb_gemras__decode_timg(data, len, &h, timg_p, x, y, comp_native);
+        }
+    }
+    if (stb_gemras__is_sttt(data, len, &h)) {
+        if (h.nplanes < 1 || h.nplanes > 8) {
+            stb_gemras__err("unsupported plane count");
+            return NULL;
+        }
+        return stb_gemras__decode_sttt(data, len, &h, x, y, comp_native);
+    }
+    if (stb_gemras__is_chunky_planes(h.nplanes)) {
+        return stb_gemras__decode_chunky(data, len, &h, x, y, comp_native);
+    }
+    if (!(h.is_ximg || h.hdr_words == 25 || h.hdr_words == 8 || h.hdr_words == 9 || h.hdr_words == 11)) {
+        stb_gemras__err("unsupported GEM variant");
+        return NULL;
+    }
+    if (h.nplanes < 1 || h.nplanes > 8) {
+        stb_gemras__err("unsupported plane count");
         return NULL;
     }
 
@@ -717,7 +1171,13 @@ static unsigned char *stb_gemras__decode(const unsigned char *data, int len,
     } else {
         /* ximg or 25-word path: palette based, never mono except via palette */
         if (h.is_ximg) {
-            stb_gemras__read_ximg_pal(data, len, h.hdr_bytes, h.nplanes, pal_r, pal_g, pal_b);
+            if (h.nplanes == 8 && h.hdr_bytes == 22) {
+                for (i = 0; i < 256; i++) {
+                    pal_r[i] = pal_g[i] = pal_b[i] = (unsigned char)(i ^ 255);
+                }
+            } else {
+                stb_gemras__read_ximg_pal(data, len, h.hdr_bytes, h.nplanes, pal_r, pal_g, pal_b);
+            }
         } else {
             int pal_pos;
             pal_pos = h.hdr_bytes - 32;
@@ -927,12 +1387,17 @@ STBGEMDEF int stb_gemras_is_from_memory(const unsigned char *data, int len)
     if (!data || len < 16) return 0;
     save = stb_gemras__g_failure;
     ok = stb_gemras__parse_header(data, len, &h);
+    if (ok) {
+        if (stb_gemras__is_falcon(data, len, &h)) ok = 1;
+        else if (stb_gemras__timg_planes(data, len, &h)) ok = 1;
+        else if (stb_gemras__is_sttt(data, len, &h)) ok = (h.nplanes >= 1 && h.nplanes <= 8);
+        else if (stb_gemras__is_chunky_planes(h.nplanes)) ok = 1;
+        else if (h.is_ximg || h.hdr_words == 25 || h.hdr_words == 8 || h.hdr_words == 9 || h.hdr_words == 11) {
+            ok = (h.nplanes >= 1 && h.nplanes <= 8);
+        } else ok = 0;
+    }
     stb_gemras__g_failure = save;
-    if (!ok) return 0;
-    /* quick sanity: header words plausible for planes */
-    if (h.is_ximg) return 1;
-    if (h.hdr_words == 8 || h.hdr_words == 9 || h.hdr_words == 25) return 1;
-    return 0;
+    return ok;
 }
 
 STBGEMDEF int stb_gemras_info_from_memory(const unsigned char *data, int len, int *x, int *y, int *comp)
@@ -946,14 +1411,19 @@ STBGEMDEF int stb_gemras_info_from_memory(const unsigned char *data, int len, in
     if (!stb_gemras__parse_header(data, len, &h)) {
         return 0;
     }
-    if (!stb_gemras__is_supported(&h)) {
-        return 0;
-    }
-    /* native comp: 1 for mono GEM, 3 otherwise */
-    if (!h.is_ximg && h.hdr_words != 25 && h.nplanes == 1) {
-        native = 1;
-    } else {
-        native = 3;
+    {
+        int v;
+        v = stb_gemras__classify(data, len, &h);
+        if (!v) {
+            return 0;
+        }
+        if (v != STB_GEMRAS__V_PLANAR) {
+            native = 3;
+        } else if (!h.is_ximg && h.hdr_words != 25 && h.nplanes == 1) {
+            native = 1;
+        } else {
+            native = 3;
+        }
     }
     if (x) *x = h.npwidth;
     if (y) *y = h.height;
@@ -1091,12 +1561,18 @@ STBGEMDEF int stb_gemras_is_file(const char *filename)
     if (!buf) return 0;
     save = stb_gemras__g_failure;
     ok = stb_gemras__parse_header(buf, len, &h);
+    if (ok) {
+        if (stb_gemras__is_falcon(buf, len, &h)) ok = 1;
+        else if (stb_gemras__timg_planes(buf, len, &h)) ok = 1;
+        else if (stb_gemras__is_sttt(buf, len, &h)) ok = (h.nplanes >= 1 && h.nplanes <= 8);
+        else if (stb_gemras__is_chunky_planes(h.nplanes)) ok = 1;
+        else if (h.is_ximg || h.hdr_words == 25 || h.hdr_words == 8 || h.hdr_words == 9 || h.hdr_words == 11) {
+            ok = (h.nplanes >= 1 && h.nplanes <= 8);
+        } else ok = 0;
+    }
     STB_GEMRAS_FREE(buf);
     stb_gemras__g_failure = save;
-    if (!ok) return 0;
-    if (h.is_ximg) return 1;
-    if (h.hdr_words == 8 || h.hdr_words == 9 || h.hdr_words == 25) return 1;
-    return 0;
+    return ok;
 }
 #endif /* STB_GEMRAS_NO_STDIO */
 
