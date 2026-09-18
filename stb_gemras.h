@@ -39,7 +39,9 @@
    Native component count is 1 for monochrome GEM images and 3 otherwise.
 
     Supported variants (deark reference + recoil extensions):
-      - 8-word and 9-word headers, 1-8 planes (mono, grayscale, 3/4-plane color)
+      - 8-word headers: mono plus ST color default for 2/3/4 planes
+        (recoil behavior), grayscale otherwise
+      - 9-word headers, 1-8 planes (mono, grayscale, 3/4-plane color)
       - 25-word headers with Atari ST palette (Hyperpaint and similar)
       - XIMG extended headers with 0-1000 RGB palette (direct index)
       - XIMG 8-plane header-only grayscale, STTT 54-byte, TIMG 28-byte
@@ -650,6 +652,33 @@ static int stb_gemras__decompress(const unsigned char *data, int len,
     return stb_gemras__rle_rows(data, len, hdr_bytes, patlen, rowspan_total, h, unc);
 }
 
+/* recoil ST default palette: white/red/green/yellow/blue/magenta/cyan,
+   AA light, 55 dark, last index black (matches RECOIL_SetDefaultStPalette) */
+static void stb_gemras__setup_st_pal(int nplanes,
+    unsigned char *pr, unsigned char *pg, unsigned char *pb)
+{
+    static const unsigned char rr[16] = {255,255,0,255,0,255,0,170,85,170,0,170,0,170,0,0};
+    static const unsigned char gg[16] = {255,0,255,255,0,0,255,170,85,0,170,170,0,0,170,0};
+    static const unsigned char bb[16] = {255,0,0,0,255,255,255,170,85,0,0,0,170,170,170,0};
+    int i;
+    int ncolors;
+    for (i = 0; i < 256; i++) {
+        pr[i] = 0;
+        pg[i] = 0;
+        pb[i] = 0;
+    }
+    ncolors = 1 << nplanes;
+    if (ncolors > 16) ncolors = 16;
+    for (i = 0; i < ncolors; i++) {
+        pr[i] = rr[i];
+        pg[i] = gg[i];
+        pb[i] = bb[i];
+    }
+    pr[ncolors - 1] = 0;
+    pg[ncolors - 1] = 0;
+    pb[ncolors - 1] = 0;
+}
+
 static void stb_gemras__setup_default_pal(int nplanes, int is_color,
     unsigned char *pr, unsigned char *pg, unsigned char *pb)
 {
@@ -1165,6 +1194,8 @@ static unsigned char *stb_gemras__decode(const unsigned char *data, int len,
         }
         if (h.nplanes == 1) {
             is_mono = 1;
+        } else if (h.hdr_words == 8 && (h.nplanes == 2 || h.nplanes == 3 || h.nplanes == 4)) {
+            stb_gemras__setup_st_pal(h.nplanes, pal_r, pal_g, pal_b);
         } else {
             stb_gemras__setup_default_pal(h.nplanes, is_color, pal_r, pal_g, pal_b);
         }

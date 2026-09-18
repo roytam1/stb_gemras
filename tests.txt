@@ -14,12 +14,11 @@ transparent) which the old row-aligned decoder rejected.
 Known pixel differences vs recoil 6.4.5 `recoil2png` output (all match
 deark `gemras.c` reference behavior instead):
 - XIMG 0-1000 palette scaling rounds (`(c*255+500)/1000`, maxdiff 1 on
-  17 files: FSNAP16/256, F_030, Jinnee4, MARCHES, THALL, THING256,
+  18 files: FSNAP16/256, F_030, Jinnee4, MARCHES, THALL, THING256,
   barbaria, beauty, cndy8, donna, dupy256g, marbre, marisa, pam008,
   thing16, scrap, vision); recoil truncates (`c*255/1000`).
-- hdr8 multiplane uses grayscale (blu/grn/red/yel/tru256/venus/VRAMSNAP/
-  COLUMNS4/flag_b24/mednopal); recoil uses color default. EGFF states
-  8-field headers display gray-scale; flag_b24 data == 16gray data.
+- hdr8 2/3/4-plane uses recoil ST color default (exact match on
+  blu/grn/red/yel/tru256/venus/VRAMSNAP/COLUMNS4/flag_b24/mednopal).
 - hdr9 Ventura gray/color flag honored (16gray renders gray);
   recoil ignores the flag and renders color.
 - ST palette 9/12-bit by content autodetect (stsorry/teststtt, maxdiff
